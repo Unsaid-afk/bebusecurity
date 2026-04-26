@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Peer } from 'peerjs';
 import {
   Shield, Send, Image as ImageIcon, Lock, Trash2, Hash,
-  Video, Mic, MicOff, PhoneOff, Maximize, Minimize,
+  Video, Mic, MicOff, Phone, PhoneOff, Maximize, Minimize,
   Camera, CameraOff
 } from 'lucide-react';
 import { generateKey, encryptMessage, decryptMessage, exportKey, importKey } from '../utils/crypto';
