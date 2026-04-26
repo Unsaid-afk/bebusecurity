@@ -39,8 +39,18 @@ const ChatRoom = () => {
     return () => document.removeEventListener('visibilitychange', handleVisibility);
   }, []);
 
+  const BURN_TIME = 30; // seconds before messages self-destruct
+
   const appendMessage = (sender, text) => {
-    setMessages(prev => [...prev, { sender, text, id: Date.now() + Math.random() }]);
+    const msgId = Date.now() + Math.random();
+    setMessages(prev => [...prev, { sender, text, id: msgId, createdAt: Date.now() }]);
+
+    // Auto-burn after 30s (skip system messages)
+    if (sender !== 'system') {
+      setTimeout(() => {
+        setMessages(prev => prev.filter(m => m.id !== msgId));
+      }, BURN_TIME * 1000);
+    }
   };
 
   const createPeer = (initiator, incomingSignal) => {
@@ -308,16 +318,7 @@ const ChatRoom = () => {
               </div>
             )}
             {messages.map(m => (
-              <div key={m.id} style={{
-                alignSelf: m.sender === 'me' ? 'flex-end' : 'flex-start',
-                backgroundColor: m.sender === 'me' ? '#2563eb' : m.sender === 'system' ? 'transparent' : '#27272a',
-                padding: m.sender === 'system' ? '6px 0' : '10px 16px',
-                borderRadius: '14px', maxWidth: '80%', fontSize: '14px',
-                color: m.sender === 'system' ? '#555' : '#fff',
-                fontStyle: m.sender === 'system' ? 'italic' : 'normal',
-              }}>
-                {m.text}
-              </div>
+              <BurnMessage key={m.id} message={m} burnTime={BURN_TIME} />
             ))}
             <canvas ref={canvRef} style={{ maxWidth: '100%', borderRadius: '8px', display: 'none' }} />
             <div ref={messagesEndRef} />
@@ -439,6 +440,51 @@ const S = {
     backgroundColor: '#ef4444', color: '#fff', border: 'none', borderRadius: '8px',
     padding: '8px 14px', cursor: 'pointer', fontSize: '12px', fontWeight: '600',
   },
+};
+
+// ═══════════════════════════════════════════
+//  BURN MESSAGE COMPONENT
+// ═══════════════════════════════════════════
+const BurnMessage = ({ message: m, burnTime }) => {
+  const [timeLeft, setTimeLeft] = useState(burnTime);
+
+  useEffect(() => {
+    if (m.sender === 'system') return;
+    const interval = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - m.createdAt) / 1000);
+      const remaining = Math.max(0, burnTime - elapsed);
+      setTimeLeft(remaining);
+      if (remaining <= 0) clearInterval(interval);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [m.createdAt, m.sender, burnTime]);
+
+  const isSystem = m.sender === 'system';
+  const opacity = isSystem ? 1 : Math.max(0.15, timeLeft / burnTime);
+
+  return (
+    <div style={{
+      alignSelf: m.sender === 'me' ? 'flex-end' : 'flex-start',
+      backgroundColor: m.sender === 'me' ? '#2563eb' : isSystem ? 'transparent' : '#27272a',
+      padding: isSystem ? '6px 0' : '10px 16px',
+      borderRadius: '14px', maxWidth: '80%', fontSize: '14px',
+      color: isSystem ? '#555' : '#fff',
+      fontStyle: isSystem ? 'italic' : 'normal',
+      opacity,
+      transition: 'opacity 1s ease',
+      position: 'relative',
+    }}>
+      {m.text}
+      {!isSystem && (
+        <span style={{
+          fontSize: '9px', color: 'rgba(255,255,255,0.4)',
+          position: 'absolute', bottom: '2px', right: '8px',
+        }}>
+          🔥 {timeLeft}s
+        </span>
+      )}
+    </div>
+  );
 };
 
 export default ChatRoom;
