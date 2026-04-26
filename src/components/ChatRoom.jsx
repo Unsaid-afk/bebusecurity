@@ -4,7 +4,10 @@ import io from 'socket.io-client';
 import { Shield, Send, Image as ImageIcon, Lock, Trash2, Hash, Video, VideoOff, Phone, PhoneOff } from 'lucide-react';
 import { generateKey, encryptMessage, decryptMessage, exportKey, importKey } from '../utils/crypto';
 
-const SIGNAL_SERVER = 'http://localhost:3001';
+// Auto-detect: use localhost for dev, deployed relay for production
+const SIGNAL_SERVER = window.location.hostname === 'localhost'
+  ? 'http://localhost:3001'
+  : 'https://bebusecurity-relay.onrender.com';
 
 const ChatRoom = () => {
   const [roomCode, setRoomCode] = useState('');

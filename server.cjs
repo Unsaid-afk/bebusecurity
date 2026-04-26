@@ -37,7 +37,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {});
 });
 
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, '0.0.0.0', () => {
-  process.stdout.write(`Relay active\n`);
+  process.stdout.write(`Relay active on ${PORT}\n`);
 });
