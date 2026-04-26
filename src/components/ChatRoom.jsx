@@ -1,6 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Peer } from 'peerjs';
-import { Shield, Send, Image as ImageIcon, Lock, Trash2, Hash, Video, PhoneOff } from 'lucide-react';
+import {
+  Shield, Send, Image as ImageIcon, Lock, Trash2, Hash,
+  Video, VideoOff, Mic, MicOff, PhoneOff, Maximize, Minimize,
+  Phone, Camera, CameraOff
+} from 'lucide-react';
 import { generateKey, encryptMessage, decryptMessage, exportKey, importKey } from '../utils/crypto';
 
 const ROOM_PREFIX = 'bebu-secure-';
@@ -13,7 +17,14 @@ const ChatRoom = () => {
   const [connected, setConnected] = useState(false);
   const [isBlurred, setIsBlurred] = useState(false);
   const [status, setStatus] = useState('Enter a code to join');
+
+  // Video call states
   const [inCall, setInCall] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [isCamOff, setIsCamOff] = useState(false);
+  const [callDuration, setCallDuration] = useState(0);
+  const [hasRemoteStream, setHasRemoteStream] = useState(false);
 
   const peerRef = useRef(null);
   const connRef = useRef(null);
@@ -24,6 +35,9 @@ const ChatRoom = () => {
   const remoteVideoRef = useRef(null);
   const localStreamRef = useRef(null);
   const messagesEndRef = useRef(null);
+  const videoContainerRef = useRef(null);
+  const callTimerRef = useRef(null);
+  const activeCallRef = useRef(null);
 
   const BURN_TIME = 30;
 
@@ -37,6 +51,27 @@ const ChatRoom = () => {
     return () => document.removeEventListener('visibilitychange', handleVisibility);
   }, []);
 
+  // Call duration timer
+  useEffect(() => {
+    if (inCall && hasRemoteStream) {
+      callTimerRef.current = setInterval(() => {
+        setCallDuration(d => d + 1);
+      }, 1000);
+    } else {
+      clearInterval(callTimerRef.current);
+      setCallDuration(0);
+    }
+    return () => clearInterval(callTimerRef.current);
+  }, [inCall, hasRemoteStream]);
+
+  const formatDuration = (seconds) => {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
+  };
+
   const appendMessage = (sender, text) => {
     const msgId = Date.now() + Math.random();
     setMessages(prev => [...prev, { sender, text, id: msgId, createdAt: Date.now() }]);
@@ -49,14 +84,12 @@ const ChatRoom = () => {
 
   const setupDataConnection = (conn) => {
     connRef.current = conn;
-
     conn.on('open', async () => {
       setConnected(true);
       setStatus('Tunnel encrypted');
       const exported = await exportKey(myKeyRef.current);
       conn.send(JSON.stringify({ type: 'KEY_EXCHANGE', key: exported }));
     });
-
     conn.on('data', async (data) => {
       try {
         const payload = typeof data === 'string' ? JSON.parse(data) : JSON.parse(data.toString());
@@ -69,18 +102,40 @@ const ChatRoom = () => {
         } else if (payload.type === 'IMAGE') {
           renderVanishImage(payload.data);
         }
-      } catch (e) { /* ignore noise */ }
+      } catch (e) { /* ignore */ }
     });
-
     conn.on('close', () => {
       setConnected(false);
       setStatus('Partner disconnected.');
       connRef.current = null;
+      endCall();
     });
+    conn.on('error', () => setStatus('Connection error.'));
+  };
 
-    conn.on('error', () => {
-      setStatus('Connection error.');
+  const handleIncomingCall = (call) => {
+    // Auto-answer with our stream if we have one, else answer without
+    if (localStreamRef.current) {
+      call.answer(localStreamRef.current);
+    } else {
+      // Get our camera then answer
+      navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then(stream => {
+        localStreamRef.current = stream;
+        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+        call.answer(stream);
+        setInCall(true);
+      }).catch(() => {
+        call.answer(); // answer without video
+        setInCall(true);
+      });
+    }
+    activeCallRef.current = call;
+    call.on('stream', (stream) => {
+      setHasRemoteStream(true);
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
     });
+    call.on('close', () => endCall());
+    setInCall(true);
   };
 
   const handleJoin = async () => {
@@ -89,112 +144,126 @@ const ChatRoom = () => {
     myKeyRef.current = await generateKey();
 
     const hostId = ROOM_PREFIX + roomCode;
-    const clientId = ROOM_PREFIX + roomCode + '-client-' + Math.random().toString(36).slice(2, 6);
+    const clientId = ROOM_PREFIX + roomCode + '-c-' + Math.random().toString(36).slice(2, 6);
 
-    // First, try to be the HOST (create peer with the room ID)
     setStatus('Connecting to relay...');
 
-    const hostPeer = new Peer(hostId, {
-      debug: 0, // silent
-    });
+    const hostPeer = new Peer(hostId, { debug: 0 });
 
     hostPeer.on('open', () => {
-      // We successfully became the host
       peerRef.current = hostPeer;
       setStatus('Waiting for partner to join code ' + roomCode + '...');
-
-      // Listen for incoming connections
-      hostPeer.on('connection', (conn) => {
-        setupDataConnection(conn);
-      });
-
-      // Listen for incoming video calls
-      hostPeer.on('call', (call) => {
-        if (localStreamRef.current) {
-          call.answer(localStreamRef.current);
-        } else {
-          call.answer(); // answer without stream
-        }
-        call.on('stream', (stream) => {
-          if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
-        });
-      });
+      hostPeer.on('connection', (conn) => setupDataConnection(conn));
+      hostPeer.on('call', (call) => handleIncomingCall(call));
     });
 
     hostPeer.on('error', (err) => {
       if (err.type === 'unavailable-id') {
-        // Host ID already taken — someone is already waiting. We are the CLIENT.
         hostPeer.destroy();
-
-        const clientPeer = new Peer(clientId, {
-          debug: 0,
-        });
-
+        const clientPeer = new Peer(clientId, { debug: 0 });
         clientPeer.on('open', () => {
           peerRef.current = clientPeer;
           setStatus('Partner found! Connecting...');
-
-          // Connect to the host
           const conn = clientPeer.connect(hostId, { reliable: true });
           setupDataConnection(conn);
-
-          // Listen for incoming video calls
-          clientPeer.on('call', (call) => {
-            if (localStreamRef.current) {
-              call.answer(localStreamRef.current);
-            } else {
-              call.answer();
-            }
-            call.on('stream', (stream) => {
-              if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
-            });
-          });
+          clientPeer.on('call', (call) => handleIncomingCall(call));
         });
-
-        clientPeer.on('error', (err) => {
-          setStatus('Connection failed: ' + err.type);
-        });
+        clientPeer.on('error', (e) => setStatus('Error: ' + e.type));
       } else {
         setStatus('Error: ' + err.type + '. Try a different code.');
       }
     });
   };
 
-  // ─── VIDEO CALL ───
-  const toggleVideo = async () => {
-    if (inCall) {
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach(t => t.stop());
-        localStreamRef.current = null;
-      }
-      if (localVideoRef.current) localVideoRef.current.srcObject = null;
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-      setInCall(false);
-      return;
-    }
+  // ═══════════════════════════════════════
+  //  VIDEO CALL CONTROLS
+  // ═══════════════════════════════════════
+  const startCall = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       localStreamRef.current = stream;
       if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-      // Call the other peer
+
       const hostId = ROOM_PREFIX + roomCode;
-      const peerId = peerRef.current?.id === hostId
-        ? null // host doesn't know client id, client will call
-        : hostId;
-      if (peerId && peerRef.current) {
-        const call = peerRef.current.call(peerId, stream);
+      const targetId = peerRef.current?.id === hostId ? null : hostId;
+
+      if (targetId && peerRef.current) {
+        const call = peerRef.current.call(targetId, stream);
+        activeCallRef.current = call;
         call.on('stream', (remoteStream) => {
+          setHasRemoteStream(true);
           if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream;
         });
+        call.on('close', () => endCall());
       }
-      // If we're host, the client will call us — handled in the 'call' listener above
       setInCall(true);
+      setIsMuted(false);
+      setIsCamOff(false);
     } catch (err) {
       appendMessage('system', '⚠️ Camera/mic access denied.');
     }
   };
 
-  // ─── VANISH IMAGE ───
+  const endCall = () => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(t => t.stop());
+      localStreamRef.current = null;
+    }
+    if (localVideoRef.current) localVideoRef.current.srcObject = null;
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+    if (activeCallRef.current) {
+      activeCallRef.current.close();
+      activeCallRef.current = null;
+    }
+    setInCall(false);
+    setHasRemoteStream(false);
+    setIsFullscreen(false);
+    setIsMuted(false);
+    setIsCamOff(false);
+  };
+
+  const toggleMic = () => {
+    if (localStreamRef.current) {
+      const audioTrack = localStreamRef.current.getAudioTracks()[0];
+      if (audioTrack) {
+        audioTrack.enabled = !audioTrack.enabled;
+        setIsMuted(!audioTrack.enabled);
+      }
+    }
+  };
+
+  const toggleCamera = () => {
+    if (localStreamRef.current) {
+      const videoTrack = localStreamRef.current.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.enabled = !videoTrack.enabled;
+        setIsCamOff(!videoTrack.enabled);
+      }
+    }
+  };
+
+  const toggleFullscreen = () => {
+    if (!isFullscreen) {
+      videoContainerRef.current?.requestFullscreen?.();
+      setIsFullscreen(true);
+    } else {
+      document.exitFullscreen?.();
+      setIsFullscreen(false);
+    }
+  };
+
+  // Listen for fullscreen exit via Escape
+  useEffect(() => {
+    const onFsChange = () => {
+      if (!document.fullscreenElement) setIsFullscreen(false);
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  }, []);
+
+  // ═══════════════════════════════════════
+  //  VANISH IMAGE
+  // ═══════════════════════════════════════
   const renderVanishImage = async (encryptedData) => {
     const decryptedB64 = await decryptMessage(myKeyRef.current, encryptedData);
     const canvas = canvRef.current;
@@ -223,8 +292,7 @@ const ChatRoom = () => {
       const tempImg = new window.Image();
       tempImg.onload = async () => {
         const c = document.createElement('canvas');
-        c.width = tempImg.width;
-        c.height = tempImg.height;
+        c.width = tempImg.width; c.height = tempImg.height;
         c.getContext('2d').drawImage(tempImg, 0, 0);
         const scrubbed = c.toDataURL('image/jpeg', 0.8);
         const encrypted = await encryptMessage(peerKeyRef.current, scrubbed);
@@ -244,7 +312,9 @@ const ChatRoom = () => {
     setInput('');
   };
 
-  // ═══════════════════════════════════════ JOIN SCREEN
+  // ═══════════════════════════════════════
+  //  JOIN SCREEN
+  // ═══════════════════════════════════════
   if (!isJoined) {
     return (
       <div style={S.joinWrap}>
@@ -255,9 +325,7 @@ const ChatRoom = () => {
             Enter the same numeric key as your partner to connect.
           </p>
           <input
-            type="number"
-            placeholder="e.g. 123456"
-            value={roomCode}
+            type="number" placeholder="e.g. 123456" value={roomCode}
             onChange={e => setRoomCode(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && handleJoin()}
             style={S.codeInput}
@@ -268,9 +336,50 @@ const ChatRoom = () => {
     );
   }
 
-  // ═══════════════════════════════════════ CHAT SCREEN
+  // ═══════════════════════════════════════
+  //  FULLSCREEN VIDEO CALL (overlays everything)
+  // ═══════════════════════════════════════
+  if (inCall && isFullscreen) {
+    return (
+      <div ref={videoContainerRef} style={S.fullscreenWrap}>
+        {/* Remote video fills the screen */}
+        <video ref={remoteVideoRef} autoPlay playsInline style={S.fsRemoteVideo} />
+
+        {/* Local video PiP */}
+        <video ref={localVideoRef} autoPlay playsInline muted style={S.fsLocalVideo} />
+
+        {/* Encryption badge */}
+        <div style={S.fsBadge}>
+          <Shield size={14} color="#4ade80" />
+          <span>DTLS/SRTP Encrypted</span>
+          <span style={{ marginLeft: '12px' }}>⏱ {formatDuration(callDuration)}</span>
+        </div>
+
+        {/* Control bar */}
+        <div style={S.fsControlBar}>
+          <button onClick={toggleMic} style={{ ...S.fsBtn, backgroundColor: isMuted ? '#ef4444' : 'rgba(255,255,255,0.15)' }}>
+            {isMuted ? <MicOff size={22} /> : <Mic size={22} />}
+          </button>
+          <button onClick={toggleCamera} style={{ ...S.fsBtn, backgroundColor: isCamOff ? '#ef4444' : 'rgba(255,255,255,0.15)' }}>
+            {isCamOff ? <CameraOff size={22} /> : <Camera size={22} />}
+          </button>
+          <button onClick={endCall} style={{ ...S.fsBtn, backgroundColor: '#ef4444', width: '64px' }}>
+            <PhoneOff size={24} />
+          </button>
+          <button onClick={toggleFullscreen} style={{ ...S.fsBtn, backgroundColor: 'rgba(255,255,255,0.15)' }}>
+            <Minimize size={22} />
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ═══════════════════════════════════════
+  //  MAIN CHAT + VIDEO SCREEN
+  // ═══════════════════════════════════════
   return (
     <div style={{ ...S.chatWrap, filter: isBlurred ? 'blur(25px)' : 'none', transition: 'filter 0.3s ease' }}>
+      {/* Header */}
       <div style={S.header}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           <Shield size={18} color={connected ? '#4ade80' : '#f87171'} />
@@ -286,7 +395,10 @@ const ChatRoom = () => {
         </div>
       </div>
 
+      {/* Body */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+
+        {/* Chat Column */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
           <div style={S.msgArea}>
             {messages.length === 0 && (
@@ -295,33 +407,30 @@ const ChatRoom = () => {
                 <p style={{ margin: 0 }}>{connected ? '🔐 Secure tunnel active. Send a message.' : status}</p>
               </div>
             )}
-            {messages.map(m => (
-              <BurnMessage key={m.id} message={m} burnTime={BURN_TIME} />
-            ))}
+            {messages.map(m => <BurnMessage key={m.id} message={m} burnTime={BURN_TIME} />)}
             <canvas ref={canvRef} style={{ maxWidth: '100%', borderRadius: '8px', display: 'none' }} />
             <div ref={messagesEndRef} />
           </div>
 
+          {/* Input Bar */}
           <div style={S.inputBar}>
             <label style={{ cursor: 'pointer', color: '#555', padding: '8px', display: 'flex' }}>
               <ImageIcon size={20} />
               <input type="file" hidden accept="image/*" onChange={handleSendImage} />
             </label>
             <button
-              onClick={toggleVideo}
+              onClick={inCall ? endCall : startCall}
               disabled={!connected}
-              style={{ ...S.iconBtn, color: inCall ? '#4ade80' : '#555', opacity: connected ? 1 : 0.3 }}
-              title={inCall ? 'End Call' : 'Start Video Call'}
+              style={{ ...S.iconBtn, color: inCall ? '#ef4444' : '#4ade80', opacity: connected ? 1 : 0.3 }}
+              title={inCall ? 'End Video Call' : 'Start Video Call'}
             >
               {inCall ? <PhoneOff size={20} /> : <Video size={20} />}
             </button>
             <input
-              value={input}
-              onChange={e => setInput(e.target.value)}
+              value={input} onChange={e => setInput(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && sendMessage()}
               placeholder={connected ? 'Type a message...' : 'Waiting for connection...'}
-              disabled={!connected}
-              style={S.chatInput}
+              disabled={!connected} style={S.chatInput}
             />
             <button onClick={sendMessage} disabled={!connected} style={{ ...S.iconBtn, color: '#2563eb', opacity: connected ? 1 : 0.3 }}>
               <Send size={20} />
@@ -329,14 +438,39 @@ const ChatRoom = () => {
           </div>
         </div>
 
+        {/* Video Panel (side panel when NOT fullscreen) */}
         {inCall && (
-          <div style={S.videoPanel}>
-            <div style={{ position: 'relative', flex: 1 }}>
-              <video ref={remoteVideoRef} autoPlay playsInline style={S.remoteVideo} />
-              <video ref={localVideoRef} autoPlay playsInline muted style={S.localVideo} />
-              <div style={S.callBadge}>🔒 DTLS/SRTP Encrypted</div>
-              <button onClick={toggleVideo} style={S.endCallBtn}>
-                <PhoneOff size={20} /> End
+          <div ref={videoContainerRef} style={S.videoPanel}>
+            {/* Remote */}
+            <div style={{ flex: 1, position: 'relative', backgroundColor: '#000', borderRadius: '12px', overflow: 'hidden', margin: '8px' }}>
+              <video ref={remoteVideoRef} autoPlay playsInline style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+              {!hasRemoteStream && (
+                <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#555' }}>
+                  <p>Calling partner...</p>
+                </div>
+              )}
+              {/* Local PiP */}
+              <video ref={localVideoRef} autoPlay playsInline muted style={S.pipVideo} />
+              {/* Badge */}
+              <div style={S.callBadge}>
+                <Shield size={12} color="#4ade80" style={{ marginRight: '4px' }} />
+                Encrypted · {formatDuration(callDuration)}
+              </div>
+            </div>
+
+            {/* Controls */}
+            <div style={S.videoControls}>
+              <button onClick={toggleMic} style={{ ...S.ctrlBtn, backgroundColor: isMuted ? '#ef4444' : '#27272a' }}>
+                {isMuted ? <MicOff size={18} /> : <Mic size={18} />}
+              </button>
+              <button onClick={toggleCamera} style={{ ...S.ctrlBtn, backgroundColor: isCamOff ? '#ef4444' : '#27272a' }}>
+                {isCamOff ? <CameraOff size={18} /> : <Camera size={18} />}
+              </button>
+              <button onClick={endCall} style={{ ...S.ctrlBtn, backgroundColor: '#ef4444', flex: 1 }}>
+                <PhoneOff size={18} />
+              </button>
+              <button onClick={toggleFullscreen} style={{ ...S.ctrlBtn, backgroundColor: '#27272a' }}>
+                <Maximize size={18} />
               </button>
             </div>
           </div>
@@ -346,15 +480,15 @@ const ChatRoom = () => {
   );
 };
 
-// ═══════════════════════════════════════ BURN MESSAGE
+// ═══════════════════════════════════════
+//  BURN MESSAGE
+// ═══════════════════════════════════════
 const BurnMessage = ({ message: m, burnTime }) => {
   const [timeLeft, setTimeLeft] = useState(burnTime);
-
   useEffect(() => {
     if (m.sender === 'system') return;
     const interval = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - m.createdAt) / 1000);
-      const remaining = Math.max(0, burnTime - elapsed);
+      const remaining = Math.max(0, burnTime - Math.floor((Date.now() - m.createdAt) / 1000));
       setTimeLeft(remaining);
       if (remaining <= 0) clearInterval(interval);
     }, 1000);
@@ -384,24 +518,39 @@ const BurnMessage = ({ message: m, burnTime }) => {
   );
 };
 
-// ═══════════════════════════════════════ STYLES
+// ═══════════════════════════════════════
+//  STYLES
+// ═══════════════════════════════════════
 const S = {
+  // Join
   joinWrap: { height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#0a0a0a' },
   joinCard: { width: '340px', padding: '36px', backgroundColor: '#141414', borderRadius: '20px', textAlign: 'center', border: '1px solid #222' },
   logoRing: { width: '64px', height: '64px', borderRadius: '50%', backgroundColor: '#1a1a2e', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 20px' },
   codeInput: { width: '100%', padding: '14px', backgroundColor: '#0a0a0a', border: '1px solid #333', borderRadius: '10px', color: '#fff', textAlign: 'center', fontSize: '20px', letterSpacing: '6px', marginBottom: '16px', outline: 'none', boxSizing: 'border-box' },
   joinBtn: { width: '100%', padding: '14px', backgroundColor: '#2563eb', border: 'none', borderRadius: '10px', color: '#fff', fontWeight: '700', cursor: 'pointer', fontSize: '14px', letterSpacing: '1px' },
+
+  // Chat
   chatWrap: { height: '100vh', display: 'flex', flexDirection: 'column', backgroundColor: '#0a0a0a', color: '#e0e0e0' },
   header: { padding: '12px 20px', borderBottom: '1px solid #1a1a1a', display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
   msgArea: { flex: 1, overflowY: 'auto', padding: '20px', display: 'flex', flexDirection: 'column', gap: '10px' },
   inputBar: { display: 'flex', gap: '8px', alignItems: 'center', padding: '12px 16px', backgroundColor: '#141414', borderTop: '1px solid #1a1a1a' },
   chatInput: { flex: 1, background: 'none', border: 'none', color: '#fff', outline: 'none', fontSize: '14px' },
   iconBtn: { background: 'none', border: 'none', cursor: 'pointer', padding: '8px', display: 'flex', color: '#555' },
-  videoPanel: { width: '320px', borderLeft: '1px solid #1a1a1a', backgroundColor: '#111', display: 'flex', flexDirection: 'column' },
-  remoteVideo: { width: '100%', height: '100%', objectFit: 'cover', backgroundColor: '#000' },
-  localVideo: { position: 'absolute', bottom: '12px', right: '12px', width: '100px', height: '75px', borderRadius: '8px', objectFit: 'cover', border: '2px solid #333', backgroundColor: '#000' },
-  callBadge: { position: 'absolute', top: '10px', left: '10px', backgroundColor: 'rgba(0,0,0,0.7)', color: '#4ade80', padding: '4px 10px', borderRadius: '6px', fontSize: '10px' },
-  endCallBtn: { position: 'absolute', bottom: '12px', left: '12px', display: 'flex', alignItems: 'center', gap: '6px', backgroundColor: '#ef4444', color: '#fff', border: 'none', borderRadius: '8px', padding: '8px 14px', cursor: 'pointer', fontSize: '12px', fontWeight: '600' },
+
+  // Video Panel (side)
+  videoPanel: { width: '340px', borderLeft: '1px solid #1a1a1a', backgroundColor: '#0a0a0a', display: 'flex', flexDirection: 'column' },
+  pipVideo: { position: 'absolute', bottom: '10px', right: '10px', width: '120px', height: '90px', borderRadius: '10px', objectFit: 'cover', border: '2px solid #333', backgroundColor: '#000', zIndex: 2 },
+  callBadge: { position: 'absolute', top: '10px', left: '10px', backgroundColor: 'rgba(0,0,0,0.75)', color: '#4ade80', padding: '5px 12px', borderRadius: '8px', fontSize: '11px', display: 'flex', alignItems: 'center', zIndex: 2 },
+  videoControls: { display: 'flex', gap: '6px', padding: '8px', justifyContent: 'center' },
+  ctrlBtn: { border: 'none', borderRadius: '10px', padding: '10px 14px', cursor: 'pointer', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center' },
+
+  // Fullscreen Video
+  fullscreenWrap: { position: 'fixed', inset: 0, backgroundColor: '#000', zIndex: 9999, display: 'flex', flexDirection: 'column' },
+  fsRemoteVideo: { flex: 1, width: '100%', objectFit: 'cover' },
+  fsLocalVideo: { position: 'absolute', bottom: '100px', right: '24px', width: '200px', height: '150px', borderRadius: '14px', objectFit: 'cover', border: '3px solid rgba(255,255,255,0.2)', zIndex: 2 },
+  fsBadge: { position: 'absolute', top: '20px', left: '20px', backgroundColor: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(10px)', color: '#4ade80', padding: '8px 16px', borderRadius: '10px', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px', zIndex: 2 },
+  fsControlBar: { position: 'absolute', bottom: '30px', left: '50%', transform: 'translateX(-50%)', display: 'flex', gap: '12px', backgroundColor: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(10px)', padding: '12px 20px', borderRadius: '16px', zIndex: 3 },
+  fsBtn: { border: 'none', borderRadius: '50%', width: '48px', height: '48px', cursor: 'pointer', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center' },
 };
 
 export default ChatRoom;
